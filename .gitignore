@@ -1,0 +1,14 @@
+/bin/
+/dist/
+/certs/
+/coverage.out
+/coverage.html
+*.test
+*.prof
+*.key
+*.pem
+*.crt
+.env
+.DS_Store
+state.json
+secret.json

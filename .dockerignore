@@ -1,0 +1,11 @@
+.git
+bin
+dist
+certs
+*.key
+*.pem
+*.crt
+coverage.*
+state.json
+secret.json
+.env
