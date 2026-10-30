@@ -22,7 +22,7 @@ func TestNewID(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !validID(id) || seen[id] {
+		if !model.ValidID(id) || seen[id] {
 			t.Fatalf("invalid or repeated ID: %q", id)
 		}
 		seen[id] = true

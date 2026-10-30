@@ -155,7 +155,7 @@ func TestRegistrationLoginAndSessionLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	user := store.users[credentials.Login]
-	if !validID(user.ID) || len(user.VaultSalt) != 16 || !registered.ExpiresAt.Equal(now.Add(time.Hour)) {
+	if !model.ValidID(user.ID) || len(user.VaultSalt) != 16 || !registered.ExpiresAt.Equal(now.Add(time.Hour)) {
 		t.Fatalf("invalid account/session: user=%+v expiry=%v", user, registered.ExpiresAt)
 	}
 	if strings.Contains(user.PasswordHash, credentials.Password) || !verifyPassword(credentials.Password, user.PasswordHash) {

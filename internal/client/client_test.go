@@ -32,7 +32,7 @@ func testClient(t *testing.T, fn roundTripFunc) *Client {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.http.Transport = fn
+	c.httpClient.Transport = fn
 	return c
 }
 
@@ -50,14 +50,14 @@ func TestNew(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.http.Timeout != 30*time.Second {
-		t.Fatalf("timeout = %v", c.http.Timeout)
+	if c.httpClient.Timeout != 30*time.Second {
+		t.Fatalf("timeout = %v", c.httpClient.Timeout)
 	}
-	transport := c.http.Transport.(*http.Transport)
+	transport := c.httpClient.Transport.(*http.Transport)
 	if transport.TLSClientConfig.InsecureSkipVerify || transport.TLSClientConfig.MinVersion == 0 {
 		t.Fatal("unverified TLS")
 	}
-	if err := c.http.CheckRedirect(nil, nil); err != http.ErrUseLastResponse {
+	if err := c.httpClient.CheckRedirect(nil, nil); err != http.ErrUseLastResponse {
 		t.Fatalf("redirect policy: %v", err)
 	}
 	if _, err := New("https://example.com", filepath.Join(t.TempDir(), "missing")); err == nil {

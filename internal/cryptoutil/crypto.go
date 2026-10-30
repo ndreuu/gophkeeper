@@ -151,7 +151,7 @@ func Validate(secret model.Secret) error {
 }
 
 func newAEAD(key []byte, id string) (cipher.AEAD, error) {
-	if len(key) != keySize || !validID(id) {
+	if len(key) != keySize || !model.ValidID(id) {
 		return nil, fmt.Errorf("a 32-byte key and a 32-character lowercase hex ID are required: %w", model.ErrInvalid)
 	}
 	block, err := aes.NewCipher(key)
@@ -163,18 +163,4 @@ func newAEAD(key []byte, id string) (cipher.AEAD, error) {
 		return nil, fmt.Errorf("initialize GCM: %w", err)
 	}
 	return aead, nil
-}
-
-func validID(id string) bool {
-	if len(id) != 32 {
-		return false
-	}
-	for _, c := range id {
-		if c < '0' || c > '9' {
-			if c < 'a' || c > 'f' {
-				return false
-			}
-		}
-	}
-	return true
 }

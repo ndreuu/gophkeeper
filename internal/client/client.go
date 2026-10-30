@@ -22,10 +22,10 @@ import (
 const maxResponseSize = 128 * 1024 * 1024
 
 type Client struct {
-	baseURL *url.URL
-	http    *http.Client
-	mu      sync.RWMutex
-	token   string
+	baseURL    *url.URL
+	httpClient *http.Client
+	mu         sync.RWMutex
+	token      string
 }
 
 // New creates a client with verified TLS 1.2 or newer. caFile optionally adds
@@ -53,7 +53,7 @@ func New(serverURL, caFile string) (*Client, error) {
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSClientConfig = tlsConfig
-	return &Client{baseURL: u, http: &http.Client{
+	return &Client{baseURL: u, httpClient: &http.Client{
 		Timeout:       30 * time.Second,
 		Transport:     transport,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
@@ -103,7 +103,7 @@ func (c *Client) List(ctx context.Context) ([]model.Record, error) {
 
 // Get fetches one encrypted entry belonging to the authenticated owner.
 func (c *Client) Get(ctx context.Context, id string) (model.Record, error) {
-	if !validID(id) {
+	if !model.ValidID(id) {
 		return model.Record{}, invalidID()
 	}
 	var result model.Record
@@ -114,7 +114,7 @@ func (c *Client) Get(ctx context.Context, id string) (model.Record, error) {
 // Put creates or replaces an encrypted entry using optimistic revision checks.
 // A conflict preserves model.ErrConflict so callers can resolve stale edits.
 func (c *Client) Put(ctx context.Context, id string, request model.PutRequest) (model.Record, error) {
-	if !validID(id) {
+	if !model.ValidID(id) {
 		return model.Record{}, invalidID()
 	}
 	var result model.Record
@@ -124,7 +124,7 @@ func (c *Client) Put(ctx context.Context, id string, request model.PutRequest) (
 
 // Delete removes an entry only if its current revision matches revision.
 func (c *Client) Delete(ctx context.Context, id string, revision int64) error {
-	if !validID(id) {
+	if !model.ValidID(id) {
 		return invalidID()
 	}
 	return c.request(ctx, http.MethodDelete, "/api/v1/entries/"+id, url.Values{"revision": {strconv.FormatInt(revision, 10)}}, nil, nil, http.StatusNoContent, true)
@@ -160,7 +160,7 @@ func (c *Client) request(ctx context.Context, method, path string, query url.Val
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	response, err := c.http.Do(req)
+	response, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("contact server: %w", err)
 	}
@@ -203,20 +203,6 @@ func responseError(response *http.Response) error {
 		return fmt.Errorf("server returned %s: %w", response.Status, cause)
 	}
 	return fmt.Errorf("server returned %s", response.Status)
-}
-
-func validID(id string) bool {
-	if len(id) != 32 {
-		return false
-	}
-	for _, c := range id {
-		if c < '0' || c > '9' {
-			if c < 'a' || c > 'f' {
-				return false
-			}
-		}
-	}
-	return true
 }
 
 func invalidID() error {

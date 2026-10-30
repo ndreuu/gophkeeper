@@ -5,12 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/ndreuu/go-gophkeeper/internal/model"
 	"go.uber.org/zap"
 )
@@ -33,155 +33,157 @@ type api struct {
 
 // New creates a router. ping checks backing storage; logs contain routes/statuses, never secrets.
 func New(service Service, ping func(context.Context) error, log *zap.Logger) http.Handler {
-	r := gin.New()
+	mux := http.NewServeMux()
 	a := api{service: service, log: log}
-	r.Use(func(c *gin.Context) {
-		c.Header("Cache-Control", "no-store")
-		c.Header("X-Content-Type-Options", "nosniff")
-		start := time.Now()
-		c.Next()
-		log.Info("HTTP request", zap.String("method", c.Request.Method), zap.String("route", c.FullPath()), zap.Int("status", c.Writer.Status()), zap.Duration("duration", time.Since(start)))
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		if err := ping(r.Context()); err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "storage unavailable"})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
 	})
-	r.Use(gin.CustomRecoveryWithWriter(io.Discard, func(c *gin.Context, _ any) {
-		log.Error("request panicked")
-		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+	mux.HandleFunc("POST /api/v1/register", a.credentials(true))
+	mux.HandleFunc("POST /api/v1/login", a.credentials(false))
+	mux.HandleFunc("POST /api/v1/logout", a.authorize(func(w http.ResponseWriter, r *http.Request, _, token string) {
+		if err := service.Logout(r.Context(), token); err != nil {
+			a.fail(w, r, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	}))
-	r.GET("/healthz", func(c *gin.Context) {
-		if err := ping(c.Request.Context()); err != nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "storage unavailable"})
-			return
-		}
-		c.Status(http.StatusOK)
-	})
-	v1 := r.Group("/api/v1")
-	v1.POST("/register", a.credentials(true))
-	v1.POST("/login", a.credentials(false))
-	private := v1.Group("")
-	private.Use(a.authorize)
-	private.POST("/logout", func(c *gin.Context) {
-		if err := service.Logout(c.Request.Context(), c.GetString("token")); err != nil {
-			a.fail(c, err)
-			return
-		}
-		c.Status(http.StatusNoContent)
-	})
-	private.GET("/entries", func(c *gin.Context) {
-		entries, err := service.List(c.Request.Context(), c.GetString("owner"))
+	mux.HandleFunc("GET /api/v1/entries", a.authorize(func(w http.ResponseWriter, r *http.Request, owner, _ string) {
+		entries, err := service.List(r.Context(), owner)
 		if err != nil {
-			a.fail(c, err)
+			a.fail(w, r, err)
 			return
 		}
 		if entries == nil {
 			entries = []model.Record{}
 		}
-		c.JSON(http.StatusOK, gin.H{"entries": entries})
-	})
-	private.GET("/entries/:id", func(c *gin.Context) {
-		entry, err := service.Get(c.Request.Context(), c.GetString("owner"), c.Param("id"))
+		writeJSON(w, http.StatusOK, map[string][]model.Record{"entries": entries})
+	}))
+	mux.HandleFunc("GET /api/v1/entries/{id}", a.authorize(func(w http.ResponseWriter, r *http.Request, owner, _ string) {
+		entry, err := service.Get(r.Context(), owner, r.PathValue("id"))
 		if err != nil {
-			a.fail(c, err)
+			a.fail(w, r, err)
 			return
 		}
-		c.JSON(http.StatusOK, entry)
-	})
-	private.PUT("/entries/:id", func(c *gin.Context) {
+		writeJSON(w, http.StatusOK, entry)
+	}))
+	mux.HandleFunc("PUT /api/v1/entries/{id}", a.authorize(func(w http.ResponseWriter, r *http.Request, owner, _ string) {
 		var req model.PutRequest
-		if !a.decode(c, &req, int64((model.MaxCiphertextSize+2)/3*4+1024)) {
+		if !a.decode(w, r, &req, int64((model.MaxCiphertextSize+2)/3*4+1024)) {
 			return
 		}
-		entry, err := service.Put(c.Request.Context(), c.GetString("owner"), c.Param("id"), req)
+		entry, err := service.Put(r.Context(), owner, r.PathValue("id"), req)
 		if err != nil {
-			a.fail(c, err)
+			a.fail(w, r, err)
 			return
 		}
-		c.JSON(http.StatusOK, entry)
-	})
-	private.DELETE("/entries/:id", func(c *gin.Context) {
-		revision, err := strconv.ParseInt(c.Query("revision"), 10, 64)
+		writeJSON(w, http.StatusOK, entry)
+	}))
+	mux.HandleFunc("DELETE /api/v1/entries/{id}", a.authorize(func(w http.ResponseWriter, r *http.Request, owner, _ string) {
+		revision, err := strconv.ParseInt(r.URL.Query().Get("revision"), 10, 64)
 		if err != nil || revision <= 0 {
-			a.fail(c, model.ErrInvalid)
+			a.fail(w, r, model.ErrInvalid)
 			return
 		}
-		if err = service.Delete(c.Request.Context(), c.GetString("owner"), c.Param("id"), revision); err != nil {
-			a.fail(c, err)
+		if err = service.Delete(r.Context(), owner, r.PathValue("id"), revision); err != nil {
+			a.fail(w, r, err)
 			return
 		}
-		c.Status(http.StatusNoContent)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		response := &responseWriter{ResponseWriter: w}
+		start := time.Now()
+		defer func() {
+			if recover() != nil {
+				log.Error("request panicked")
+				if response.status == 0 {
+					writeJSON(response, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+				}
+			}
+			_, route, _ := strings.Cut(r.Pattern, " ")
+			log.Info("HTTP request", zap.String("method", r.Method), zap.String("route", route), zap.Int("status", response.status), zap.Duration("duration", time.Since(start)))
+		}()
+		mux.ServeHTTP(response, r)
 	})
-	return r
 }
 
-func (a api) credentials(register bool) gin.HandlerFunc {
-	return func(c *gin.Context) {
+func (a api) credentials(register bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		var req model.Credentials
-		if !a.decode(c, &req, 8192) {
+		if !a.decode(w, r, &req, 8192) {
 			return
 		}
 		var result model.AuthResult
 		var err error
 		status := http.StatusOK
 		if register {
-			result, err = a.service.Register(c.Request.Context(), req)
+			result, err = a.service.Register(r.Context(), req)
 			status = http.StatusCreated
 		} else {
-			result, err = a.service.Login(c.Request.Context(), req)
+			result, err = a.service.Login(r.Context(), req)
 		}
 		if err != nil {
-			a.fail(c, err)
+			a.fail(w, r, err)
 			return
 		}
-		c.JSON(status, result)
+		writeJSON(w, status, result)
 	}
 }
 
-func (a api) authorize(c *gin.Context) {
-	scheme, token, ok := strings.Cut(c.GetHeader("Authorization"), " ")
-	if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" || strings.ContainsAny(token, " \t\r\n") {
-		a.fail(c, model.ErrUnauthorized)
-		return
+func (a api) authorize(next func(http.ResponseWriter, *http.Request, string, string)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		scheme, token, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+		if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" || strings.ContainsAny(token, " \t\r\n") {
+			a.fail(w, r, model.ErrUnauthorized)
+			return
+		}
+		owner, err := a.service.Authenticate(r.Context(), token)
+		if err != nil {
+			a.fail(w, r, err)
+			return
+		}
+		next(w, r, owner, token)
 	}
-	owner, err := a.service.Authenticate(c.Request.Context(), token)
-	if err != nil {
-		a.fail(c, err)
-		return
-	}
-	c.Set("owner", owner)
-	c.Set("token", token)
-	c.Next()
 }
 
-func (a api) decode(c *gin.Context, dest any, limit int64) bool {
-	if contentType := c.ContentType(); contentType != "application/json" {
-		c.AbortWithStatusJSON(http.StatusUnsupportedMediaType, gin.H{"error": "application/json required"})
+func (a api) decode(w http.ResponseWriter, r *http.Request, dest any, limit int64) bool {
+	if contentType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || contentType != "application/json" {
+		writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "application/json required"})
 		return false
 	}
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
-	decoder := json.NewDecoder(c.Request.Body)
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(dest); err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request too large"})
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request too large"})
 		} else {
-			a.fail(c, model.ErrInvalid)
+			a.fail(w, r, model.ErrInvalid)
 		}
 		return false
 	}
 	if err := decoder.Decode(new(any)); err != io.EOF {
-		a.fail(c, model.ErrInvalid)
+		a.fail(w, r, model.ErrInvalid)
 		return false
 	}
 	return true
 }
 
-func (a api) fail(c *gin.Context, err error) {
+func (a api) fail(w http.ResponseWriter, r *http.Request, err error) {
 	status, message := http.StatusInternalServerError, "internal server error"
 	switch {
 	case errors.Is(err, model.ErrInvalid):
 		status, message = http.StatusBadRequest, "invalid input"
 	case errors.Is(err, model.ErrUnauthorized):
 		status, message = http.StatusUnauthorized, "authentication required"
-		c.Header("WWW-Authenticate", "Bearer")
+		w.Header().Set("WWW-Authenticate", "Bearer")
 	case errors.Is(err, model.ErrNotFound):
 		status, message = http.StatusNotFound, "entry not found"
 	case errors.Is(err, model.ErrConflict):
@@ -189,7 +191,34 @@ func (a api) fail(c *gin.Context, err error) {
 	case errors.Is(err, model.ErrCapacity):
 		status, message = http.StatusRequestEntityTooLarge, "vault capacity exceeded (64 MiB or 10000 encrypted entries)"
 	default:
-		a.log.Error("service request failed", zap.String("route", c.FullPath()))
+		_, route, _ := strings.Cut(r.Pattern, " ")
+		a.log.Error("service request failed", zap.String("route", route))
 	}
-	c.AbortWithStatusJSON(status, gin.H{"error": message})
+	writeJSON(w, status, map[string]string{"error": message})
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+type responseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *responseWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *responseWriter) Write(body []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(body)
 }

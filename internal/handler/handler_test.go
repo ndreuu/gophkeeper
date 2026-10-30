@@ -21,6 +21,7 @@ import (
 	"github.com/ndreuu/go-gophkeeper/internal/model"
 	"github.com/ndreuu/go-gophkeeper/internal/service"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 type memoryStore struct {
@@ -334,5 +335,101 @@ func TestMaximumCiphertextFitsJSONEnvelope(t *testing.T) {
 	r := New(failingService{}, func(context.Context) error { return nil }, zap.NewNop())
 	if w := request(r, "PUT", "/api/v1/entries/id", string(body), "Bearer token"); w.Code != 200 {
 		t.Fatalf("maximum valid ciphertext rejected: %d", w.Code)
+	}
+}
+
+func TestRoutingAndSecurityHeaders(t *testing.T) {
+	router := New(failingService{}, func(context.Context) error { return nil }, zap.NewNop())
+	for _, tc := range []struct {
+		method string
+		path   string
+		token  string
+		status int
+		allow  string
+	}{
+		{"GET", "/healthz", "", 200, ""},
+		{"HEAD", "/healthz", "", 200, ""},
+		{"POST", "/healthz", "", 405, "GET, HEAD"},
+		{"GET", "/api/v1/login", "", 405, "POST"},
+		{"POST", "/api/v1/entries", "Bearer token", 405, "GET, HEAD"},
+		{"GET", "/api/v1/entries", "Bearer token", 200, ""},
+		{"GET", "/api/v1/entries", "", 401, ""},
+		{"GET", "/api/v1/entries/id/extra", "Bearer token", 404, ""},
+		{"GET", "/unknown", "", 404, ""},
+	} {
+		t.Run(tc.method+" "+tc.path+" "+tc.token, func(t *testing.T) {
+			w := request(router, tc.method, tc.path, "", tc.token)
+			if w.Code != tc.status || w.Header().Get("Allow") != tc.allow {
+				t.Fatalf("status=%d Allow=%q; want status=%d Allow=%q", w.Code, w.Header().Get("Allow"), tc.status, tc.allow)
+			}
+			if w.Header().Get("Cache-Control") != "no-store" || w.Header().Get("X-Content-Type-Options") != "nosniff" {
+				t.Fatalf("security headers: %v", w.Header())
+			}
+			if tc.status == http.StatusUnauthorized && w.Header().Get("WWW-Authenticate") != "Bearer" {
+				t.Fatalf("authentication challenge: %v", w.Header())
+			}
+		})
+	}
+}
+
+func TestRequestLogsDoNotContainSecrets(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		service failingService
+		method  string
+		path    string
+		body    string
+		status  int
+		route   string
+	}{
+		{"service error", failingService{err: errors.New("secret-error")}, "GET", "/api/v1/entries/secret-id?value=secret-query", "", 500, "/api/v1/entries/{id}"},
+		{"panic", failingService{panicAuth: true}, "GET", "/api/v1/entries/secret-id?value=secret-query", "", 500, "/api/v1/entries/{id}"},
+		{"credentials", failingService{err: errors.New("secret-error")}, "POST", "/api/v1/login", `{"login":"alice","password":"secret-password"}`, 500, "/api/v1/login"},
+		{"unknown route", failingService{}, "GET", "/secret-path?value=secret-query", "", 404, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			core, logs := observer.New(zap.DebugLevel)
+			router := New(tc.service, func(context.Context) error { return nil }, zap.New(core))
+			w := request(router, tc.method, tc.path, tc.body, "Bearer secret-token")
+			if w.Code != tc.status || strings.Contains(w.Body.String(), "secret") {
+				t.Fatalf("response: %d %s", w.Code, w.Body.String())
+			}
+			for _, entry := range logs.All() {
+				if strings.Contains(entry.Message+fmt.Sprint(entry.ContextMap()), "secret") {
+					t.Fatalf("secret in log: %+v", entry)
+				}
+			}
+			requests := logs.FilterMessage("HTTP request").All()
+			if len(requests) != 1 {
+				t.Fatalf("request logs: %v", requests)
+			}
+			fields := requests[0].ContextMap()
+			if fields["route"] != tc.route || fields["method"] != tc.method || fields["status"] != int64(tc.status) {
+				t.Fatalf("request fields: %v", fields)
+			}
+		})
+	}
+}
+
+func TestJSONContentType(t *testing.T) {
+	router := New(failingService{}, func(context.Context) error { return nil }, zap.NewNop())
+	for _, tc := range []struct {
+		contentType string
+		status      int
+	}{
+		{"application/json", 200},
+		{"application/json; charset=utf-8", 200},
+		{"text/plain", 415},
+		{"application/json; charset", 415},
+	} {
+		t.Run(tc.contentType, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "/api/v1/login", strings.NewReader(`{}`))
+			r.Header.Set("Content-Type", tc.contentType)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, r)
+			if w.Code != tc.status || w.Header().Get("Content-Type") != "application/json; charset=utf-8" {
+				t.Fatalf("status=%d Content-Type=%q", w.Code, w.Header().Get("Content-Type"))
+			}
+		})
 	}
 }

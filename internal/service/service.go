@@ -253,21 +253,8 @@ func validateCredentials(credentials model.Credentials) error {
 	return nil
 }
 
-func validID(id string) bool {
-	if len(id) != 32 {
-		return false
-	}
-	for _, character := range id {
-		if character >= '0' && character <= '9' || character >= 'a' && character <= 'f' {
-			continue
-		}
-		return false
-	}
-	return true
-}
-
 func validateOwner(id string) error {
-	if !validID(id) {
+	if !model.ValidID(id) {
 		return model.ErrUnauthorized
 	}
 	return nil
@@ -277,7 +264,7 @@ func validateRecordIdentity(userID, id string) error {
 	if err := validateOwner(userID); err != nil {
 		return err
 	}
-	if !validID(id) {
+	if !model.ValidID(id) {
 		return fmt.Errorf("%w: entry ID must contain 32 lowercase hexadecimal characters", model.ErrInvalid)
 	}
 	return nil
