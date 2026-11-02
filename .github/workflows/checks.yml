@@ -1,0 +1,39 @@
+name: checks
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: gophkeeper_test
+          POSTGRES_USER: gophkeeper
+          POSTGRES_PASSWORD: test-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U gophkeeper -d gophkeeper_test"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      GOPHKEEPER_TEST_DATABASE_DSN: postgres://gophkeeper:test-password@localhost:5432/gophkeeper_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: make vet test
+      - run: make build release VERSION=${{ github.sha }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clients
+          path: dist/
